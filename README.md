@@ -22,7 +22,7 @@
   │               └─ format_docs → context string
   │
   ▼
-[LLM Chain]     ChatGemini (gemini-1.5-flash)
+[LLM Chain]     ChatGemini (gemini-2.5-flash-light)
   │               └─ ChatPromptTemplate (system + human)
   │               └─ JsonOutputParser
   │
