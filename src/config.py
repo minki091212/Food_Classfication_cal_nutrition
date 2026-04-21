@@ -5,7 +5,7 @@ import os
 load_dotenv()
 
 GOOGLE_API_KEY: str = os.environ["GOOGLE_API_KEY"]
-VISION_MODEL        = "gemini-1.5-flash"
+VISION_MODEL        = "gemini-2.5-flash-lite"
 
 _raw_paths = os.getenv(
     "FOOD_DATA_PATHS",
