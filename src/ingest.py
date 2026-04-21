@@ -1,32 +1,47 @@
 """
-여러 xlsx 식품 데이터를 읽어 합친 뒤
-LangChain Document로 변환 후 HuggingFace 로컬 임베딩으로 ChromaDB에 저장
+xlsx 식품 데이터를 SQLite DB로 변환 (최초 1회 실행)
 
 실행: uv run ingest
 """
+import sqlite3
 from pathlib import Path
-import shutil
 
 import pandas as pd
-from langchain_core.documents import Document
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from rich.console import Console
 from rich.progress import track
 
-from src.config import (
-    FOOD_DATA_PATHS,
-    CHROMA_DB_PATH,
-    COLLECTION_NAME,
-    NUTRITION_COLUMNS,
-    EMBEDDING_MODEL,
-)
+from src.config import FOOD_DATA_PATHS, DB_PATH, COLUMN_MAP
 
 console = Console()
 
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS foods (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    food_name        TEXT NOT NULL,
+    serving_size     TEXT,
+    calories_kcal    REAL,
+    moisture_g       REAL,
+    protein_g        REAL,
+    fat_g            REAL,
+    ash_g            REAL,
+    carbohydrate_g   REAL,
+    sugar_g          REAL,
+    dietary_fiber_g  REAL,
+    calcium_mg       REAL,
+    iron_mg          REAL,
+    phosphorus_mg    REAL,
+    potassium_mg     REAL,
+    sodium_mg        REAL,
+    source           TEXT
+);
+"""
+
+CREATE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_food_name ON foods (food_name);
+"""
+
 
 def load_all_xlsx(paths: list[Path]) -> pd.DataFrame:
-    """여러 xlsx 파일을 읽어 필요한 컬럼만 추출 후 하나로 합침"""
     frames = []
     for path in paths:
         if not path.exists():
@@ -36,12 +51,14 @@ def load_all_xlsx(paths: list[Path]) -> pd.DataFrame:
         console.print(f"[blue]로드 중:[/blue] {path.name}")
         df = pd.read_excel(path)
 
-        available = [c for c in NUTRITION_COLUMNS if c in df.columns]
-        missing   = [c for c in NUTRITION_COLUMNS if c not in df.columns]
+        # 필요한 컬럼만 선택
+        available = {k: v for k, v in COLUMN_MAP.items() if k in df.columns}
+        missing   = [k for k in COLUMN_MAP if k not in df.columns]
         if missing:
             console.print(f"  [yellow]누락 컬럼:[/yellow] {missing}")
 
-        df = df[available].dropna(subset=["식품명"]).reset_index(drop=True)
+        df = df[list(available.keys())].rename(columns=available)
+        df = df.dropna(subset=["food_name"]).reset_index(drop=True)
         df["source"] = path.name
         console.print(f"  [green]완료:[/green] {len(df):,}개 식품")
         frames.append(df)
@@ -50,80 +67,48 @@ def load_all_xlsx(paths: list[Path]) -> pd.DataFrame:
         raise FileNotFoundError(f"로드 가능한 파일이 없습니다: {paths}")
 
     combined = pd.concat(frames, ignore_index=True)
-    console.print(f"\n[bold green]전체 합계:[/bold green] {len(combined):,}개 식품 ({len(frames)}개 파일 병합)\n")
+    console.print(f"\n[bold green]전체 합계:[/bold green] {len(combined):,}개 ({len(frames)}개 파일)\n")
     return combined
 
 
-def df_to_documents(df: pd.DataFrame) -> list[Document]:
-    """DataFrame 행을 LangChain Document로 변환"""
-    docs = []
-    for _, row in df.iterrows():
-        lines = [f"{col}: {row[col]}" for col in NUTRITION_COLUMNS
-                 if col in row.index and pd.notna(row[col])]
-        page_content = "\n".join(lines)
+def build_db(df: pd.DataFrame) -> None:
+    db_path = Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        metadata: dict = {"source": str(row.get("source", ""))}
-        for col in NUTRITION_COLUMNS:
-            val = row.get(col)
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                metadata[col] = ""
-            elif isinstance(val, (int, float)):
-                metadata[col] = float(val)
-            else:
-                metadata[col] = str(val)
+    if db_path.exists():
+        db_path.unlink()
+        console.print("[yellow]기존 DB 삭제[/yellow]")
 
-        docs.append(Document(page_content=page_content, metadata=metadata))
-    return docs
+    con = sqlite3.connect(DB_PATH)
+    con.execute(CREATE_TABLE_SQL)
+    con.execute(CREATE_INDEX_SQL)
 
+    # 숫자 컬럼 강제 변환 (문자열 섞인 경우 대비)
+    numeric_cols = [c for c in df.columns if c not in ("food_name", "serving_size", "source")]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-def ingest(documents: list[Document]) -> None:
-    """HuggingFace 로컬 임베딩으로 ChromaDB에 배치 저장"""
-    if Path(CHROMA_DB_PATH).exists():
-        shutil.rmtree(CHROMA_DB_PATH)
-        console.print("[yellow]기존 벡터 DB 삭제[/yellow]")
+    batch_size = 5000
+    total = len(df)
+    for start in track(range(0, total, batch_size), description="SQLite 저장 중..."):
+        df.iloc[start : start + batch_size].to_sql(
+            "foods", con, if_exists="append", index=False
+        )
 
-    console.print(f"임베딩 모델 로드 중: [cyan]{EMBEDDING_MODEL}[/cyan]")
-    console.print("(최초 실행 시 모델 다운로드 ~400MB, 이후 캐시 사용)\n")
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-    # 로컬 임베딩은 rate limit 없음 → 배치 500건
-    batch_size = 500
-    total = len(documents)
-    vectorstore = None
-
-    for start in track(range(0, total, batch_size), description="벡터 DB 저장 중..."):
-        batch = documents[start : start + batch_size]
-        ids   = [f"food_{i}" for i in range(start, start + len(batch))]
-
-        if vectorstore is None:
-            vectorstore = Chroma.from_documents(
-                documents=batch,
-                embedding=embeddings,
-                ids=ids,
-                collection_name=COLLECTION_NAME,
-                persist_directory=CHROMA_DB_PATH,
-            )
-        else:
-            vectorstore.add_documents(documents=batch, ids=ids)
-
-    console.print(f"[bold green]✓ 저장 완료:[/bold green] {total:,}개 → {CHROMA_DB_PATH}")
+    con.commit()
+    con.close()
+    console.print(f"[bold green]✓ 완료:[/bold green] {total:,}개 → {DB_PATH}")
 
 
 def main():
-    console.rule("[bold]식품 데이터 벡터 DB 구축[/bold]")
+    console.rule("[bold]식품 데이터 SQLite DB 구축[/bold]")
     console.print(f"대상 파일 {len(FOOD_DATA_PATHS)}개:")
     for p in FOOD_DATA_PATHS:
         console.print(f"  • {p}")
     console.print()
 
-    df        = load_all_xlsx(FOOD_DATA_PATHS)
-    documents = df_to_documents(df)
-    ingest(documents)
+    df = load_all_xlsx(FOOD_DATA_PATHS)
+    build_db(df)
 
     console.rule("[bold green]완료[/bold green]")
 
